@@ -68,14 +68,16 @@ BMW navigation would. How it gets there depends on the car's cluster; the instal
 |---|---|---|
 | Who draws | **We do.** The plugin draws every picture itself, polygon by polygon, on the cluster's `HUDTerminal` over MOST. | **The car does.** The plugin sends the route data to the KOMBI's own guidance service (SOME/IP), and the cluster and the HUD draw it with their own graphics. |
 | Pictures | Mapbox's maneuver and lane drawings, turned into HUD polygons (previews below). | The car's own arrows, distance and lane row. |
-| Status | **Tested in a car.** MINI F54 (HMI 1703): pictures, distance, street, HUD effects, lanes. BMW F30 (NBT Evo ID5 1803, Build 66): maneuver arrow, distance, street and day/night HUD effects; v1.3.0 auto-setup read the 126×77 picture buffer. | **Not tested in a car.** A port of NBT-AAD's car-verified KOMBI stack (see Credits), checked against a fake KOMBI only. |
+| Status | **Tested in a car.** MINI F54 (HMI 1703): pictures, distance, street, HUD effects, lanes. BMW F30 (NBT Evo ID5 1803, Build 66): maneuver arrow, distance, street and day/night HUD effects; v1.3.0 automatic fitting to the 126×77 picture buffer was visually verified without `hud_box` or `hud_hide`, with no stray distance bar. | **Not tested in a car.** A port of NBT-AAD's car-verified KOMBI stack (see Credits), checked against a fake KOMBI only. |
 
 **On the MOST cluster** the plugin takes the cluster's own handles from the BMW navigation's set-up at start (they differ between
 clusters: an F25 X3 has its texts elsewhere than a MINI), asks the cluster how big its picture area is and fits the arrow into it,
 and also draws on a second HUDTerminal (82/02) when the navigation uses one. Distances keep their decimal point ("1.5 km").
 The picture size is read automatically with `ImageGetSize`, so different buffer sizes do not normally need a manual `hud_box`;
 the distance bar identified from the navigation's set-up is hidden automatically too. Auto-setup has run on the MINI F54 and BMW F30
-(the F30 reported 126×77). The earlier F30 and F25 tests used manual settings. The files `hud_box`, `hud_hide`, `hud_inst` and
+(the F30 reported 126×77). On 2026-11-21 the F30 was tested again after removing `hud_box` and `hud_hide` and restarting the head:
+the automatically fitted arrow, distance and street displayed normally, with no stray distance bar. Earlier F30 and F25 tests used
+manual settings. The files `hud_box`, `hud_hide`, `hud_inst` and
 `hud_text_handles` (AGENTS.md) remain overrides for clusters whose set-up or size cannot be read, or for additional surfaces to hide;
 `sh carplay-advanced.sh hud-probe` shows what the cluster has.
 
@@ -101,7 +103,7 @@ Car-tested configurations:
 | Model | HMI build | Verified |
 |---|---|---|
 | MINI F54, 8.8" | `ID5_1703-490-1650ZD Build 139` | Full-screen CarPlay, iDrive controls, MOST HUD guidance and effects, lanes |
-| BMW F30 | `ID5_1803-510-1749I Build 66` | v1.3.0 full install with scanned HMI addresses: full-screen CarPlay, knob tilts, rotation and touchpad; MOST HUD guidance and day/night effects; auto-setup read a 126×77 buffer |
+| BMW F30 | `ID5_1803-510-1749I Build 66` | v1.3.0 full install with scanned HMI addresses: full-screen CarPlay, knob tilts, rotation and touchpad; MOST HUD guidance and day/night effects; automatic fitting to a 126×77 buffer, visually verified without `hud_box` / `hud_hide` |
 
 Build 66 is not yet in the built-in hash table below: its full install used the installer's HMI scan.
 
