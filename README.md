@@ -90,6 +90,12 @@ The pictures as the plugin draws them (white = the way to go, grey = context). T
 
 The BMW navigation always wins: while it guides, the CarPlay directions step aside.
 
+Route data belongs to one CarPlay connection. When its `mm-ipod` ends, a watcher retires only that session's RAM snapshots and
+links, including in the full-menu install. A late update or watcher cannot remove a newer session's route data. The watcher polls every
+10 seconds; the HUD reader and another navigation client's quiet period can add delay. Connected but quiet guidance does not expire.
+RAM snapshots are lost at reboot; boot cleanup retires legacy disk routes only before HMI and mm-ipod start. Publication failures
+and recovery are logged without route contents.
+
 ## Supported software
 
 The menu plugin patches the HMI's code in memory at fixed addresses, so it supports exact software builds, recognised by file

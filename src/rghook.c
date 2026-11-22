@@ -33,6 +33,19 @@ extern void *memmove(void *, const void *, unsigned long);
 extern int strcmp(const char *, const char *);
 extern unsigned long strlen(const char *);
 extern int sched_yield(void);
+extern int getpid(void);
+extern int symlink(const char *, const char *);
+/* Freestanding QNX build; host harnesses use their libc's thread-local errno accessor. */
+#if defined(__APPLE__)
+extern int *__error(void);
+#define RG_ERRNO (*__error())
+#elif defined(__linux__)
+extern int *__errno_location(void);
+#define RG_ERRNO (*__errno_location())
+#else
+extern int *__get_errno_ptr(void);
+#define RG_ERRNO (*__get_errno_ptr())
+#endif
 static void *libc(const char *n) {
   return dlsym(dlopen("libc.so.3", 2), n);
 }
@@ -328,11 +341,42 @@ static u32 cur_view(u32 *dist, char *ds, u32 cap) {
   }
   return st.next_idx;
 }
+/* Each session owns a different target: a late watcher cannot erase a new route, and RAM never survives a reboot. */
+static int route_file(char *out, unsigned cap) {
+  const char *base = getenv("RGHOOK_PPS");
+  int n = snprintf(out, cap, "%s.%d", base ? base : "/dev/shmem/carplaymenu-routeguidance", getpid());
+  return n > 0 && (unsigned)n < cap;
+}
+static const char *publish_error;
+static int publish_errno;
+static void publish_fail(const char *op, const char *path, int error, long result, unsigned expected) {
+  if (publish_error == op && publish_errno == error)
+    return;
+  publish_error = op;
+  publish_errno = error;
+  char b[420];
+  snprintf(b, sizeof b, "RG publish %s failed: path=%s errno=%d result=%ld expected=%u\n", op, path, error, result, expected);
+  log_text(b);
+}
+static int route_link(char *out, unsigned cap) {
+  const char *p = getenv("RGHOOK_PPS");
+  int n = snprintf(out, cap, "%s.carplaymenu.%d", p ? p : "/var/iap/pps/routeguidance", getpid());
+  return n > 0 && (unsigned)n < cap;
+}
 static void publish(void) {
   const char *p = getenv("RGHOOK_PPS");
-  char tmp[160], b[2048];
   if (!p)
     p = "/var/iap/pps/routeguidance";
+  static u32 sequence;
+  static int linked, reported;
+  static char previous[176];
+  char base[160], file[176], link[192], tmp[196], b[2048];
+  if (!route_file(base, sizeof base) || !route_link(link, sizeof link)) {
+    publish_fail("path", p, 0, -1, 0);
+    return;
+  }
+  snprintf(file, sizeof file, "%s.%u", base, ++sequence);
+  snprintf(tmp, sizeof tmp, "%s.tmp", link);
   u32 cur = st.cur_idx, dist = st.dist;
   char ds[32];
   if (st.has_cur)
@@ -374,13 +418,70 @@ static void publish(void) {
       k += snprintf(b + k, sizeof b - k, "\n");
     }
   }
-  snprintf(tmp, sizeof tmp, "%s.tmp", p);
-  int fd = r_open(tmp, 0x301, 0644);
-  if (fd < 0)
+  if (k <= 0 || k >= (int)sizeof b) {
+    publish_fail("format", file, 0, k, sizeof b - 1);
     return;
-  r_write(fd, b, (u32)k);
-  r_close(fd);
-  r_rename(tmp, p);
+  }
+  /* QNX /dev/shmem rename returns EXDEV. Commit a complete, unique RAM object through a disk symlink instead. */
+  int fd = r_open(file, 0x301, 0644);
+  if (fd < 0) {
+    publish_fail("open", file, RG_ERRNO, fd, k);
+    return;
+  }
+  long written = r_write(fd, b, (u32)k);
+  int error = written < 0 ? RG_ERRNO : 0;
+  int closed = r_close(fd), close_error = closed < 0 ? RG_ERRNO : 0;
+  if (written != k || closed != 0) {
+    publish_fail(written != k ? "write" : "close", file, written != k ? error : close_error, written != k ? written : closed,
+                 written != k ? k : 0);
+    r_unlink(file);
+    return;
+  }
+  if (r_unlink(tmp) < 0 && RG_ERRNO != 2 /* ENOENT */) {
+    publish_fail("unlink temporary link", tmp, RG_ERRNO, -1, 0);
+    r_unlink(file);
+    return;
+  }
+  if (symlink(file, tmp) != 0) {
+    publish_fail("symlink session", tmp, RG_ERRNO, -1, 0);
+    r_unlink(file);
+    return;
+  }
+  if (r_rename(tmp, link) != 0) {
+    publish_fail("rename session", link, RG_ERRNO, -1, 0);
+    r_unlink(tmp);
+    r_unlink(file);
+    return;
+  }
+  char old[176];
+  snprintf(old, sizeof old, "%s", previous);
+  snprintf(previous, sizeof previous, "%s", file);
+  int cleanup_error = old[0] && r_unlink(old) < 0 ? RG_ERRNO : 0;
+  if (!linked) {
+    if (symlink(link, p) != 0) {
+      int e = RG_ERRNO;
+      if (e != 17 /* EEXIST: never replace a newer session's public link */) {
+        publish_fail("symlink public", p, e, -1, 0);
+        return;
+      }
+      char msg[256];
+      snprintf(msg, sizeof msg, "RG publish public link already exists, left unchanged: path=%s errno=%d\n", p, e);
+      log_text(msg);
+    }
+    linked = 1;
+  }
+  if (cleanup_error && cleanup_error != 2) {
+    publish_fail("unlink old snapshot", old, cleanup_error, -1, 0);
+    return;
+  }
+  if (!reported || publish_error) {
+    char msg[420];
+    snprintf(msg, sizeof msg, "RG publish %s: session=%s snapshot=%s bytes=%d\n", publish_error ? "recovered" : "ready", link, file,
+             k);
+    log_text(msg);
+    reported = 1;
+  }
+  publish_error = 0;
 }
 /* LaneGuidanceInformation (0x5204): 1 LaneGuidanceIndex, 2 LaneInformation (one per lane, repeated), 3 description. Inside a
    LaneInformation: 0 position (u16, a new lane), 1 status (u8), 2 angles (s16 each, the TLV repeated or a list), 3 highlight angle (s16,
@@ -490,6 +591,7 @@ static void on_rg(u32 mid, const u8 *p, u32 n) {
   st_lock();
   on_rg_locked(mid, p, n);
   st_unlock();
+  rg_watch_once();
   kick();
 }
 static void on_rg_locked(u32 mid, const u8 *p, u32 n) {
@@ -822,8 +924,8 @@ static void packet_done(void) {
 #endif
   }
 }
-static u32 scan_in(u8 *b,
-                   u32 n) { /* returns how many bytes to hand to the driver (the rest is an incomplete packet start kept in held_buf) */
+static u32
+scan_in(u8 *b, u32 n) { /* returns how many bytes to hand to the driver (the rest is an incomplete packet start kept in held_buf) */
   u32 i = 0;
   while (i < n) {
     if (pkt_left) {
@@ -912,16 +1014,16 @@ static u32 scan_in(u8 *b,
   }
   return n;
 }
-/* The route guidance state belongs to one iPhone session: a new mm-ipod (Connectivity restarts it for every session) starts without
-   the previous file, so the HUD (src/hud.h) never keeps an old route; within a session the iPhone ends a route itself
-   (RouteGuidanceUpdate state 2 Arrived / 0 NoRouteSet). close() is not hooked: mm-ipod calls it while the libraries are still loading,
-   before libc can be looked up (it crashed). */
+/* A new mm-ipod starts without the previous session's link. Its watcher retires its own RAM target at disconnect.
+   close() is not hooked: mm-ipod calls it before libc can be looked up (it crashed). */
 static void rg_clear(void) {
   const char *p = getenv("RGHOOK_PPS");
   st_lock();
   memset(&st, 0, sizeof st);
   st_unlock();
-  r_unlink(p ? p : "/var/iap/pps/routeguidance");
+  p = p ? p : "/var/iap/pps/routeguidance";
+  if (r_unlink(p) < 0 && RG_ERRNO != 2 /* ENOENT */)
+    publish_fail("unlink public", p, RG_ERRNO, -1, 0);
 }
 
 /* ---------------- for the KOMBI sender (rgview.h) ---------------- */
@@ -1001,35 +1103,38 @@ long rg_fd_read(int fd, void *buf, unsigned n) {
   init();
   return r_read(fd, buf, n);
 }
-#if defined(RGHOOK_KOMBI) || defined(RGHOOK_MOST)
-/* The watcher (ksh, P_NOWAITO so it outlives mm-ipod; mm-ipod lives for one CarPlay session): polls our pid every 3 s, then has
-   libcpprobe.so clear what a marker still names us for. RGHOOK_NO_WATCH: none (tests). */
+/* The watcher (ksh, P_NOWAITO so it outlives mm-ipod; mm-ipod lives for one CarPlay session): polls our pid every 10 s, then has
+   the route file removed; drawing variants also have libcpprobe.so clear their marked arrows. RGHOOK_NO_WATCH: none (tests). */
 extern int spawnle(int, const char *, const char *, ...);
-extern int getpid(void);
 void rg_watch_once(void) {
   static volatile int done;
   if (__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL))
     return;
   if (getenv("RGHOOK_NO_WATCH"))
     return;
+  char file[160], link[192], pid[16];
+  if (!route_file(file, sizeof file) || !route_link(link, sizeof link))
+    return;
+  snprintf(pid, sizeof pid, "%d", getpid());
+  static const char sc[] =
+      "while kill -0 \"$1\" 2>/dev/null; do sleep 10; done; rm -f \"$2\" \"$2\".* \"$3\" \"$3.tmp\""
+#if defined(RGHOOK_KOMBI) || defined(RGHOOK_MOST)
+      "; [ -f \"$4\" ] && CPM_CLEAR=\"$1\" CPM_KOMBI_MARKER=\"$5\" LD_PRELOAD=\"$4\" /bin/cat < /dev/null > /dev/null 2>&1"
+#endif
+      ;
   static const char lib[] = "/var/opt/hmi/data/rw/Plugins/CarPlayMenu/libcpprobe.so";
   const char *mk = getenv("RGHOOK_MARKER");
-  char sc[512];
-  int pid = getpid();
-  snprintf(sc, sizeof sc,
-           "while kill -0 %d 2>/dev/null; do sleep 3; done; [ -f %s ] && CPM_CLEAR=%d CPM_KOMBI_MARKER=%s LD_PRELOAD=%s /bin/cat"
-           " < /dev/null > /dev/null 2>&1",
-           pid, lib, pid, mk && *mk ? mk : RG_KOMBI_MARKER, lib);
-  static char *const envp[] = {(char *)"PATH=/bin:/usr/bin:/proc/boot", 0};
+  static char *const envp[] = { (char *)"PATH=/bin:/usr/bin:/proc/boot", 0 };
   char b[96];
-  if (spawnle(3 /* P_NOWAITO */, "/bin/ksh", "ksh", "-c", sc, (char *)0, envp) == -1) {
-    log_text("watcher not started: an arrow left when mm-ipod ends stays until the next session\n");
+  if (spawnle(3 /* P_NOWAITO */, "/bin/ksh", "ksh", "-c", sc, "rghook-watch", pid, file, link, lib,
+              mk && *mk ? mk : RG_KOMBI_MARKER, (char *)0, envp) == -1) {
+    __atomic_store_n(&done, 0, __ATOMIC_RELEASE);
+    log_text("watcher not started: route cleanup will retry on the next guidance message\n");
     return;
   }
-  snprintf(b, sizeof b, "watcher started for pid %d (clears an arrow left when mm-ipod ends)\n", pid);
+  snprintf(b, sizeof b, "watcher started for pid %s (clears its route when mm-ipod ends)\n", pid);
   log_text(b);
 }
-#endif
 void rg_log_line(const char *s) {
   char b[300];
   snprintf(b, sizeof b, "%s\n", s);

@@ -24,6 +24,7 @@ extern int unlink(const char *); extern int rename(const char *, const char *); 
 extern long strtol(const char *, char **, int);
 static int mac_open(const char *p, int f, ...) { return f ? open(p, 0x601 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644) : open(p, 0); }
 static long mac_write(int fd, const void *b, size_t n) { return write(fd, b, n); }
+int spawnle(int m, const char *p, const char *a, ...) { return -1; }  /* watcher exercised in test_rghook_session.py */
 static int hexv(char c) { return c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10; }
 int main(int argc, char **argv) {          // message id (hex) and its parameters (hex), one pair per argument pair
   r_open = mac_open; r_write = (long (*)(int, const void *, size_t))mac_write; r_close = close; r_unlink = unlink; r_rename = rename;
