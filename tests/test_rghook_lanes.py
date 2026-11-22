@@ -29,6 +29,7 @@ static int hexv(char c) { return c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10; 
 int main(int argc, char **argv) {          // message id (hex) and its parameters (hex), one pair per argument pair
   r_open = mac_open; r_write = (long (*)(int, const void *, size_t))mac_write; r_close = close; r_unlink = unlink; r_rename = rename;
   inited = 1; logfd = -1;
+  rg_clear();
   for (int i = 1; i + 1 < argc; i += 2) {
     static u8 b[4096]; u32 n = 0; const char *h = argv[i + 1];
     for (; h[0] && h[1] && n < sizeof b; h += 2) b[n++] = (u8)(hexv(h[0]) << 4 | hexv(h[1]));
@@ -83,7 +84,7 @@ class RgHookLanes(unittest.TestCase):
         args = [str(self.exe)]
         for mid, payload in msgs:
             args += ['%x' % mid, payload.hex()]
-        subprocess.run(args, check=True, env=dict(os.environ, RGHOOK_PPS=str(pps)))
+        subprocess.run(args, check=True, env=dict(os.environ, RGHOOK_PPS=str(pps), RGHOOK_NO_WATCH='1'))
         return dict(l.split(':', 2)[0::2] for l in pps.read_text().splitlines() if l.count(':') >= 2)
 
     def test_lanes_published_left_to_right(self):

@@ -31,7 +31,7 @@ void rgk_kick(void);                                       /* rgkombi.cpp: guida
 void rgh_kick(void);                                       /* rghud.cpp: guidance arrived; starts the MOST HUD drawing once */
 /* rghook.c: once per mm-ipod, a watcher removes its session's route file when its pid ends. Drawing variants also run libcpprobe.so
    with CPM_CLEAR=<pid> to clear arrows whose markers still name that pid. */
-void rg_watch_once(void);
+int rg_watch_once(void);                                   /* 1 only after successful spawn; 0 = do not publish/draw yet */
 #define RG_KOMBI_MARKER "/dev/shmem/carplaymenu-kombi.shown"
 #define RG_MOST_MARKER "/dev/shmem/carplaymenu-most.shown"
 

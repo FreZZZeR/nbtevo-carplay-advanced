@@ -363,18 +363,22 @@ static int route_link(char *out, unsigned cap) {
   int n = snprintf(out, cap, "%s.carplaymenu.%d", p ? p : "/var/iap/pps/routeguidance", getpid());
   return n > 0 && (unsigned)n < cap;
 }
+static int session_claimed;
+static volatile int watch_state; /* 0 idle, 1 spawning, 2 ready */
 static void publish(void) {
   const char *p = getenv("RGHOOK_PPS");
   if (!p)
     p = "/var/iap/pps/routeguidance";
   static u32 sequence;
-  static int linked, reported;
+  static int reported;
   static char previous[176];
   char base[160], file[176], link[192], tmp[196], b[2048];
   if (!route_file(base, sizeof base) || !route_link(link, sizeof link)) {
     publish_fail("path", p, 0, -1, 0);
     return;
   }
+  if (!session_claimed || __atomic_load_n(&watch_state, __ATOMIC_ACQUIRE) != 2)
+    return;
   snprintf(file, sizeof file, "%s.%u", base, ++sequence);
   snprintf(tmp, sizeof tmp, "%s.tmp", link);
   u32 cur = st.cur_idx, dist = st.dist;
@@ -457,19 +461,6 @@ static void publish(void) {
   snprintf(old, sizeof old, "%s", previous);
   snprintf(previous, sizeof previous, "%s", file);
   int cleanup_error = old[0] && r_unlink(old) < 0 ? RG_ERRNO : 0;
-  if (!linked) {
-    if (symlink(link, p) != 0) {
-      int e = RG_ERRNO;
-      if (e != 17 /* EEXIST: never replace a newer session's public link */) {
-        publish_fail("symlink public", p, e, -1, 0);
-        return;
-      }
-      char msg[256];
-      snprintf(msg, sizeof msg, "RG publish public link already exists, left unchanged: path=%s errno=%d\n", p, e);
-      log_text(msg);
-    }
-    linked = 1;
-  }
   if (cleanup_error && cleanup_error != 2) {
     publish_fail("unlink old snapshot", old, cleanup_error, -1, 0);
     return;
@@ -580,6 +571,8 @@ static void exit_from(char *o, u32 cap, const char *t) {
 }
 static void on_rg_locked(u32 mid, const u8 *p, u32 n);
 static void kick(void) {
+  if (!session_claimed || __atomic_load_n(&watch_state, __ATOMIC_ACQUIRE) != 2)
+    return;
 #ifdef RGHOOK_KOMBI
   rgk_kick();
 #endif
@@ -588,10 +581,11 @@ static void kick(void) {
 #endif
 }
 static void on_rg(u32 mid, const u8 *p, u32 n) {
+  if (session_claimed)
+    rg_watch_once();
   st_lock();
   on_rg_locked(mid, p, n);
   st_unlock();
-  rg_watch_once();
   kick();
 }
 static void on_rg_locked(u32 mid, const u8 *p, u32 n) {
@@ -1014,16 +1008,40 @@ scan_in(u8 *b, u32 n) { /* returns how many bytes to hand to the driver (the res
   }
   return n;
 }
-/* A new mm-ipod starts without the previous session's link. Its watcher retires its own RAM target at disconnect.
+/* Select the owner at initialization, before guidance can arrive in either overlapping session.
    close() is not hooked: mm-ipod calls it before libc can be looked up (it crashed). */
 static void rg_clear(void) {
   const char *p = getenv("RGHOOK_PPS");
+  session_claimed = 0;
   st_lock();
   memset(&st, 0, sizeof st);
   st_unlock();
   p = p ? p : "/var/iap/pps/routeguidance";
-  if (r_unlink(p) < 0 && RG_ERRNO != 2 /* ENOENT */)
-    publish_fail("unlink public", p, RG_ERRNO, -1, 0);
+  char link[192], tmp[200];
+  if (!route_link(link, sizeof link)) {
+    publish_fail("claim path", p, 0, -1, 0);
+    return;
+  }
+  snprintf(tmp, sizeof tmp, "%s.claim", link);
+  if (r_unlink(link) < 0 && RG_ERRNO != 2 /* ENOENT */) {
+    publish_fail("unlink session", link, RG_ERRNO, -1, 0);
+    return;
+  }
+  if (r_unlink(tmp) < 0 && RG_ERRNO != 2 /* ENOENT */) {
+    publish_fail("unlink claim", tmp, RG_ERRNO, -1, 0);
+    return;
+  }
+  if (symlink(link, tmp) != 0) {
+    publish_fail("symlink claim", tmp, RG_ERRNO, -1, 0);
+    return;
+  }
+  if (r_rename(tmp, p) != 0) {
+    publish_fail("rename claim", p, RG_ERRNO, -1, 0);
+    r_unlink(tmp);
+    return;
+  }
+  /* Never retry a failed claim on a later message: an older session could steal a newer owner's alias. */
+  session_claimed = 1;
 }
 
 /* ---------------- for the KOMBI sender (rgview.h) ---------------- */
@@ -1106,15 +1124,19 @@ long rg_fd_read(int fd, void *buf, unsigned n) {
 /* The watcher (ksh, P_NOWAITO so it outlives mm-ipod; mm-ipod lives for one CarPlay session): polls our pid every 10 s, then has
    the route file removed; drawing variants also have libcpprobe.so clear their marked arrows. RGHOOK_NO_WATCH: none (tests). */
 extern int spawnle(int, const char *, const char *, ...);
-void rg_watch_once(void) {
-  static volatile int done;
-  if (__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL))
-    return;
-  if (getenv("RGHOOK_NO_WATCH"))
-    return;
+int rg_watch_once(void) {
+  int expected = 0;
+  if (!__atomic_compare_exchange_n(&watch_state, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return expected == 2;
+  if (getenv("RGHOOK_NO_WATCH")) {
+    __atomic_store_n(&watch_state, 2, __ATOMIC_RELEASE);
+    return 1;
+  }
   char file[160], link[192], pid[16];
-  if (!route_file(file, sizeof file) || !route_link(link, sizeof link))
-    return;
+  if (!route_file(file, sizeof file) || !route_link(link, sizeof link)) {
+    __atomic_store_n(&watch_state, 0, __ATOMIC_RELEASE);
+    return 0;
+  }
   snprintf(pid, sizeof pid, "%d", getpid());
   static const char sc[] =
       "while kill -0 \"$1\" 2>/dev/null; do sleep 10; done; rm -f \"$2\" \"$2\".* \"$3\" \"$3.tmp\""
@@ -1128,12 +1150,14 @@ void rg_watch_once(void) {
   char b[96];
   if (spawnle(3 /* P_NOWAITO */, "/bin/ksh", "ksh", "-c", sc, "rghook-watch", pid, file, link, lib,
               mk && *mk ? mk : RG_KOMBI_MARKER, (char *)0, envp) == -1) {
-    __atomic_store_n(&done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&watch_state, 0, __ATOMIC_RELEASE);
     log_text("watcher not started: route cleanup will retry on the next guidance message\n");
-    return;
+    return 0;
   }
   snprintf(b, sizeof b, "watcher started for pid %s (clears its route when mm-ipod ends)\n", pid);
   log_text(b);
+  __atomic_store_n(&watch_state, 2, __ATOMIC_RELEASE);
+  return 1;
 }
 void rg_log_line(const char *s) {
   char b[300];
