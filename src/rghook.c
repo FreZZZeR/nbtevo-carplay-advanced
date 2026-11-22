@@ -914,7 +914,8 @@ static void packet_done(void) {
 #ifdef RGHOOK_MOST
     /* The MOST client starts with the CarPlay session, not with the first route message: its loop also takes the HUD test channel
        (hud-probe, tools/hud_probe.sh) and "HUD debug log", which in a HUD-only install had no client while no route guided. */
-    rgh_kick();
+    if (session_claimed && rg_watch_once())
+      rgh_kick();
 #endif
   }
 }

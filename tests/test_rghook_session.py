@@ -36,6 +36,7 @@ HARNESS = r'''
 #undef write
 #undef symlink
 static int watcher, spawn_attempts, short_write, fault;
+static int most_kicks;
 static volatile int spawn_entered, spawn_release;
 static void kill_at_active_publication(void) {
   if (!getenv("TEST_KILL_ACTIVE_PUBLICATION")) return;
@@ -47,7 +48,7 @@ static void kill_at_active_publication(void) {
   if (strstr(b, "route_state:n:1\n")) kill(getpid(), SIGKILL);
 }
 void rgk_kick(void) {}  /* variant senders are covered separately; here only their watcher is exercised */
-void rgh_kick(void) {}
+void rgh_kick(void) { most_kicks++; }
 int spawnle(int mode, const char *path, const char *arg, ...) {
   if (getenv("TEST_SPAWN_FAIL_ALWAYS")) { errno = EAGAIN; return -1; }
   if (getenv("TEST_SPAWN_FAIL_ONCE") && ++spawn_attempts == 1) return -1;
@@ -116,7 +117,13 @@ int main(void) {
   rg_clear();
   char line[8192];
   while (fgets(line, sizeof line, stdin)) {
-    if (!strncmp(line, "watchrace", 9)) {
+    if (!strncmp(line, "accepted", 8)) {
+      ident_ok = auth_ok = 1; injected = pkt_ctl = 0;
+      transport_fd = open("/dev/null", O_WRONLY);
+      packet_done();
+      close(transport_fd); transport_fd = -1;
+    }
+    else if (!strncmp(line, "watchrace", 9)) {
       pthread_t t; int ready;
       if (pthread_create(&t, 0, start_watcher, &ready)) return 2;
       while (!__atomic_load_n(&spawn_entered, __ATOMIC_ACQUIRE)) usleep(1000);
@@ -133,7 +140,7 @@ int main(void) {
       while (e[0] > ' ' && e[1] > ' ' && n < sizeof b) { b[n++] = (u8)(hexv(e[0]) << 4 | hexv(e[1])); e += 2; }
       on_rg(mid, b, n);
     }
-    printf("ok %d %d\n", getpid(), watcher); fflush(stdout);
+    printf("ok %d %d %d\n", getpid(), watcher, most_kicks); fflush(stdout);
   }
   return 0;
 }
@@ -203,6 +210,7 @@ class RouteSession(unittest.TestCase):
         watcher = int(reply[2])
         if watcher > 0:
             self.watchers.add(watcher)
+        return int(reply[3])
 
     def wait_removed(self, path):
         deadline = time.monotonic() + 20
@@ -238,6 +246,26 @@ class RouteSession(unittest.TestCase):
         p.wait(timeout=5)
         if self.pps.exists():
             self.assertNotIn('route_state:n:1', self.pps.read_text())
+
+    def test_accepted_link_waits_for_watcher_before_starting_most(self):
+        p = self.start(variant='most', publish=False)
+        self.assertEqual(self.command(p, 'accepted'), 1)
+        self.assertEqual(len(self.watchers), 1)
+        self.assertFalse(self.pps.exists(), 'link-up does not invent route data')
+
+    def test_failed_claim_cannot_start_early_most_reader(self):
+        legacy = '@routeguidance\nroute_state:n:1\ndist_to_maneuver:n:999\n'
+        self.pps.write_text(legacy)
+        p = self.start(variant='most', publish=False, TEST_CLAIM_FAIL_ONCE='1')
+        self.assertEqual(self.command(p, 'accepted'), 0)
+        self.assertEqual(len(self.watchers), 0)
+        self.assertEqual(self.pps.read_text(), legacy)
+
+    def test_failed_watcher_cannot_start_early_most_reader(self):
+        p = self.start(variant='most', publish=False, TEST_SPAWN_FAIL_ALWAYS='1')
+        self.assertEqual(self.command(p, 'accepted'), 0)
+        self.assertEqual(len(self.watchers), 0)
+        self.assertFalse(self.pps.exists())
 
     def test_starting_watcher_is_not_ready_for_another_thread(self):
         watcher_file = Path(self.tmp.name) / 'watcher.pid'
